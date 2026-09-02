@@ -1,0 +1,213 @@
+---
+title: "Link Prediction"
+author: "Clare McGarvey and Paloma Navarro"
+---
+
+## Introduction
+
+This page frames link prediction as a binary classification problem on the Epstein network: can proximity-based heuristics distinguish real relationships from non-existent ones? We train a logistic regression classifier on similarity metrics computed from held-out edges, evaluate it with cross-validation, and identify which heuristic is most predictive.
+
+The network studied in this file is an extension of the previous one (Network Exploration), now constructed from the top 1700 nodes, rather than the top 500. Again, it solely examines the giant component. Following the final robustness check in the previous analysis, this file will work on the filtered network in which all "unknown" composite nodes have been removed. As discussed there, these nodes represent multiple distinct individuals collapsed into a single label by the data extraction pipeline, and they distort centrality and structural measures. The graph is also left unweighted, using neighbourhood overlap and degree to predict links. 
+
+
+## Set-Up
+
+```{r setup, results='hide', message=FALSE, warning=FALSE}
+source("data-prep.R")
+library(boot)
+library(caret)
+```
+
+## Network Construction
+
+```{r construct-network}
+# Build edge list from actor-target pairs
+edgelist <- raw[, c("actor", "target")]
+
+# Count how often each entity appears
+entity_freq <- table(c(edgelist$actor, edgelist$target))
+top1700       <- names(sort(entity_freq, decreasing = TRUE))[1:1700]
+
+# Keep edges where both endpoints are in the top 1700
+edgelist <- edgelist[edgelist$actor %in% top1700 & edgelist$target %in% top1700, ]
+
+# Build and simplify
+epstein <- graph.data.frame(edgelist, directed = FALSE)
+epstein <- igraph::simplify(epstein)
+epstein
+
+# Filter out "unknown" composite nodes 
+unknown_nodes <- V(epstein)$name[grepl("unknown", V(epstein)$name, ignore.case = TRUE)]
+cat("Removing", length(unknown_nodes), "unknown composite nodes\n")
+epstein <- delete_vertices(epstein, unknown_nodes)
+
+# Using giant component
+epstein <- decompose(epstein)[[which.max(sapply(decompose(epstein), vcount))]]
+
+# Node and Edges Count
+cat("Nodes:", vcount(epstein), "\n")
+cat("Edges:", ecount(epstein), "\n")
+```
+
+## Link Removal: held out edges
+
+To train and test a prediction model, 20% of the 5124 links in the network will be removed as the positive class, and an equal number of edges between well-connected nodes that do not exist in the network will be sampled as the negative class.
+
+```{r held-out-edges}
+nlinks <- floor(0.2 * ecount(epstein)) # Deleting 20% of nodes
+
+# Sampling 5000 random edge indices from the full network
+set.seed(111)
+indexes_deleted <- sample(1:ecount(epstein), nlinks)
+
+# The "observed" graph with those edges removed
+epstein_prime <- delete_edges(epstein, indexes_deleted)
+
+# Positive Class - Deleted Edges
+deleted_endpoints <- get.edges(epstein, indexes_deleted)
+true_edges <- data.frame(
+  X1  = deleted_endpoints[, 1],
+  X2  = deleted_endpoints[, 2]
+)
+
+# Negative class: non-existent links from well-connected nodes
+false_edges    <- data.frame()
+most_connected <- which(degree(epstein) > 10)
+
+set.seed(111)
+while (nrow(false_edges) < nlinks) {
+  node_pair <- sample(most_connected, 2)
+  node1     <- node_pair[1]
+  node2     <- node_pair[2]
+  
+  if (get.edge.ids(epstein, c(node1, node2)) == 0) {
+    false_edges <- rbind(false_edges, data.frame(X1 = node1, X2 = node2))
+  }
+}
+
+# Assign obs labels and bind
+true_edges  <- data.frame(true_edges,  obs = 1)
+false_edges <- data.frame(false_edges, obs = 0)
+
+total_edges           <- rbind(true_edges, false_edges)
+colnames(total_edges) <- c("id1", "id2", "obs")
+
+head(total_edges)
+```
+
+## Proximity Metrics
+
+Generate a number of proximity/similarty metrics heuristics for each link in the positive and negative class
+
+For every real or fake edge in `total_edges`, three proximity metrics are computed on the network with the positive class edges removed (`epstein_prime`). These metrics are Jaccard, Adamic-Adar and Preferential Attachment. They measure the following:
+
+-   **Jaccard** (`sim_jacc`): the fraction of neighbours that two nodes share, where 1 indicates identical neighbours and 0 is no overlap at all.
+
+-   **Adamic-Adar** (`sim_aa`): counts common neighbours like Jaccard, but weights each shared neighbour by the inverse log of their degree. This metric captures the logic that a shared neighbour who only has a few connections indicates a stronger link.
+
+-   **Preferential Attachment** (`sim_pref`): the product of the two nodes' degrees, capturing the likelihood of two nodes being connected based on their overall popularity. 
+
+```{r similarity-heuristics}
+n1 <- neighborhood(epstein_prime, order = 1, nodes = total_edges$id1)
+n2 <- neighborhood(epstein_prime, order = 1, nodes = total_edges$id2)
+
+total_edges$sim_jacc <- 0
+total_edges$sim_aa   <- 0
+total_edges$sim_pref <- 0
+
+for (i in 1:nrow(total_edges)) {
+  nei1   <- n1[[i]]
+  nei2   <- n2[[i]]
+  common <- intersect(nei1, nei2)
+
+  # Jaccard: fraction of shared neighbours
+  all_nei <- union(nei1, nei2)
+  if (length(all_nei) > 0) {
+    total_edges$sim_jacc[i] <- length(common) / length(all_nei)
+  }
+
+  # Adamic-Adar: shared neighbours weighted by inverse log degree
+  if (length(common) > 0) {
+    deg_common <- degree(epstein_prime, common)
+    deg_common <- deg_common[deg_common > 1]
+    total_edges$sim_aa[i] <- sum(1 / log(deg_common))
+  }
+
+  # Preferential attachment: product of degrees
+  total_edges$sim_pref[i] <- degree(epstein_prime, total_edges$id1[i]) *
+                               degree(epstein_prime, total_edges$id2[i])
+}
+
+head(total_edges)
+```
+
+## Classifier and Cross-Validation
+
+We frame link prediction as a binary classification problem (there either exists a link or not) and fit a logistic regression model on the three heuristics computed above. A 10-fold cross-validation is then run to check the model generalises and is not overfitting to a single train/test split
+
+```{r train-classifier}
+# Train and test split
+set.seed(111)
+train_idx <- sample(1:nrow(total_edges), 0.7 * nrow(total_edges))
+total_edges_train <- total_edges[train_idx, ]
+total_edges_test  <- total_edges[-train_idx, ]
+
+# Logistic regression model
+glm_link <- glm(obs ~ sim_jacc + sim_aa + sim_pref,
+                data   = total_edges_train,
+                family = binomial(link = "logit"))
+
+summary(glm_link)
+```
+
+```{r predict-test-set}
+# Predict on the test set
+glm_prediction <- predict.glm(glm_link,
+                              newdata = total_edges_test,
+                              type    = "response")
+```
+
+```{r cross-validation}
+set.seed(111)
+glm_full <- glm(obs ~ sim_jacc + sim_aa + sim_pref,
+                data   = total_edges,
+                family = binomial(link = "logit"))
+
+cv_result <- cv.glm(total_edges, glm_full, K = 10)
+cat("10-fold CV error estimate:", round(cv_result$delta[1], 4), "\n")
+```
+
+The 10-fold cross-validation error is 0.227. A model which just guesses gives an error of 0.25, so while the model has learnt slightly from the data it is not too far from just randomly guessing.
+
+## Model Evaluation
+
+We evaluate the model with a confusion matrix using a 0.5 probability threshold.
+
+```{r confusion-matrix}
+# Apply threshold
+pred <- ifelse(glm_prediction > 0.5, 1, 0)
+
+# Confusion matrix
+conf_mat <- confusionMatrix(factor(pred, levels = c(0, 1)),
+                            factor(total_edges_test$obs, levels = c(0, 1)),
+                            positive = "1")
+conf_mat
+```
+
+The accuracy of the model is 0.631, indicating that the model correctly predicts the presence of a link around 63% of the time. The sensitivity (0.484) is  is well below the specificity (0.775), illustrating the model correctly identifies the absence of a link significantly better than its presence. The Kappa value is 0.259, indicating that the model is better than randomly guessing but fails to predict a significant amount of the true links.
+
+The `summary(glm_link)` output above shows the coefficient and significance (z-statistic, p-value) of each heuristic. The heuristic with the largest absolute z-statistic is the most important predictor. From the below table, it can be seen that Adamic-Adar (z = 7.06, p < 0.001) and Preferential Attachment (z = -3.46, p < 0.001) are statistically significant predictors, whereas Jaccard is not (z = 0.54, p = 0.59). Of the three, Adamic-Adar has the largest absolute z-value and therefore is the most important, indicating that what best predicts the presence of a link is the shared neighbours of two nodes, weighted by the inverse log of the degree (where a connection with a less popular neighbour signifies a stronger link).
+
+```{r coefficient-significance}
+# Extract z-statistics from the fitted model
+coefs <- summary(glm_link)$coefficients
+coefs
+```
+
+## Possible Improvements
+
+*Using the type of relationship*: The original dataset includes a description of the relationship between the different actors of the network. For the purpose of this work, we collapsed all of these into a single undirected edge and discarded the actual nature of these interactions/ relationships (sending an email, signing a deposition, travelling together, being accused by, prosecuting, etc.). To make more accurate predictions, we could incorporate the relationship type as an edge feature, or train separate models per relationship type, giving the predictor much richer information than a binary "connected or not".
+
+*Using weighted edges*: We are treating every pair of entities that ever appeared together in a document as connected, regardless of how often. If we incorporated the number of times two entities interact, we could distinguish between strong and incidental relationships and provide the heuristics with more precise input.
+
+*Add node-level features*: The current model only uses proximity metrics to predict whether a link exists between two nodes. Adding additional node-level features such as degree, centrality and community membership would give the model richer detail and potentially improve the accuracy of predictions.

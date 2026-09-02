@@ -1,0 +1,20 @@
+---
+title: "Index"
+format: html
+---
+
+## Project Scope
+
+This project aims to provide an exploration into the network of actors named in the 'Epstein Files', a collection of documents, images, videos and emails related to the U.S. financier and convicted pedophile Jeffrey Epstein. The files detail Epstein's deep influence among his social circle of international elites, and his prolific sex-trafficking of underage girls to members of said circle.
+
+Following the signing of the Epstein Files Transparency Act into law in November of 2025, the U.S. Department of Justice has released over 3 million individual files pertaining to Epstein. Max Andrews created a [visualiser](https://epsteinvisualizer.com) of the social network of entities detailed in the files by extracting structured data from the raw documents using AI (Andrews, 2025). We thank him for his valuable contribution to a case which has been largely abandoned by traditional avenues of justice, left instead to journalists and members of the public to search for the truth and attempt to hold power to account. A snapshot of his data captured 31/08/2026 is used throughout the project, due to the active expansion of the dataset. Current figures may differ.
+
+This project explores the network in three parts:
+
+-   [Network Exploration](01-network-exploration.qmd) — structure, degree, communities, centrality
+-   [Link Prediction](02-link-prediction.qmd) — predicting missing edges from network heuristics
+-   [Diffusion Modelling](03-diffusion-modelling.qmd) — simulating how information spreads through the network
+
+## References
+
+Andrews, M. (2025). Epstein-doc-explorer: a graph explorer of the Epstein emails \[Dataset\]. In GitHub. https://github.com/maxandrews/Epstein-doc-explorer

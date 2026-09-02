@@ -1,0 +1,335 @@
+---
+title: "Network Exploration"
+author: "Clare McGarvey and Paloma Navarro"
+---
+
+## Introduction
+
+This file provides an exploratory analysis of the social network of Jeffrey Epstein, covering the structure, degree, assortativity, communities and centrality. The network is constructed from the top 500 nodes and examines only the giant component. 
+
+## Data Preparation
+
+```{r setup, results='hide', message=FALSE, warning=FALSE}
+source("data-prep.R")
+```
+
+## Network Construction
+
+```{r plotting network}
+# Filtering to top 500 nodes
+top_actors <- raw |>
+  count(actor, name = "freq") |>
+  slice_max(freq, n = 500) |>
+  pull(actor)
+
+edges <- raw |>
+  filter(actor %in% top_actors, target %in% top_actors) |>
+  count(actor, target, name = "weight")
+
+cat("After top-500 filter:", nrow(edges), "edges |", 
+    n_distinct(c(edges$actor, edges$target)), "nodes\n")
+
+# Igraph object
+colnames(edges)[1:2] <- c("from", "to")
+edges <- edges[!is.na(edges$from) & !is.na(edges$to), ]
+
+g <- graph_from_data_frame(edges, directed = FALSE)
+g <- simplify(g, remove.multiple = TRUE, remove.loops = TRUE,
+              edge.attr.comb = list(weight = "sum"))
+
+cat("iGraph nodes:", vcount(g), "\n")
+cat("iGraph edges:", ecount(g), "\n")
+
+# Giant component
+components <- decompose(g)
+gGC <- components[[which.max(sapply(components, vcount))]]
+
+cat("Giant component nodes:", vcount(gGC), "\n")
+cat("Giant component edges:", ecount(gGC), "\n")
+
+# ggraph plot
+ggraph(gGC, layout = "fr") +
+  geom_edge_link(aes(alpha = weight), colour = "grey50") +
+  scale_edge_alpha(range = c(0.05, 0.6)) +
+  geom_node_point(aes(size = degree(gGC)), colour = "steelblue", alpha = 0.8) +
+  scale_size(range = c(1, 8)) +
+  geom_node_text(
+    aes(label = ifelse(
+      degree(gGC) > quantile(degree(gGC), 0.95) | name == "Jeffrey Epstein",
+      name, ""
+    )),
+    size = 2.5, repel = TRUE, max.overlaps = Inf
+  ) +
+  theme_graph() +
+  labs(title = "Epstein Document Network", size = "Degree")
+```
+
+## Network Description
+
+```{r RDF Triples}
+#  Top 30 actor/action/target combinations by weight
+edges_sample <- raw |>
+  count(actor, action, target, name = "weight") |>
+  arrange(desc(weight)) |>
+  slice_head(n = 30)
+
+print(edges_sample)
+
+raw |>
+  count(action, name = "freq") |>
+  arrange(desc(freq)) |>
+  slice_head(n = 50)
+```
+
+```{r network-description}
+data.frame(
+  Nodes       = vcount(gGC),
+  Edges       = ecount(gGC),
+  Sparsity    = 1 - (round(2 * ecount(gGC) / (vcount(gGC) * (vcount(gGC) - 1)), 4)),
+  Diameter    = diameter(gGC),
+  Clustering  = round(transitivity(gGC, type = "global"), 4)
+) |> 
+  kable(caption = "Epstein Document Network — Summary Statistics") |>
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+# Top 5 by degree
+sort(degree(gGC), decreasing = TRUE)[1:5]
+```
+
+This network captures the actors present within the House Oversight Committee's [recent releases of documents](https://www.justice.gov/epstein) related to highly-connected US financier and child sex offender Jeffrey Epstein, extracted via AI. It is an undirected network constructed from RDF triples of the form actor -\> action -\> target (for example, Jeffrey Epstein -\> sent email to -\> Ghislaine Maxwell) and the edges are weighted by the number of appearances of that specific actor/target pair. The most prevalent action is 'sent an email' followed by 'authored', 'met with' and 'sent message to' which reflects the digital nature of many of the documents.
+
+The network has over 19,000 total entities but, due to project constraints, has been limited to include only the top 500 and focuses exclusively on the giant component. It contains 456 nodes and 2022 edges, with a sparsity of 0.981. The five most connected nodes are Jeffrey Epstein, unknown person A, Donald Trump, Alan Dershowitz and unknown person B.
+
+The unknown nodes represent entities whose identities have been redacted from the files. From a singular document, the first unknown entity extracted is labelled 'unknown person A', the second 'unknown person B' and so on. These unknown actors includes victims of Epstein, whose identities were removed for privacy and protection, as well as Epstein's co-conspirators, associates, employees and other individuals. Therefore, these 'unknown person' actors are a composition of various distinct entities of differing types collapsed into a singular node, which artificially inflates their degree and centrality. Despite this, we have decided to keep them in the main analysis for transparency as they provide useful information about the network, and to include an additional robustness check at the end in which they are removed, to understand how much they affect our results.
+
+## Degree
+
+```{r degree-distribution}
+data.frame(
+  Mean_Degree = round(mean(degree(gGC)), 2),
+  SD_Degree   = round(sd(degree(gGC)), 2),
+  Median_Degree = median(degree(gGC))
+) |> 
+  kable(caption = "Epstein Document Network — Degree") |>
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+quantile(degree(gGC)) 
+```
+
+The network has an average degree of 8.87, meaning that each actor is connected to around 9 others on average. However, the standard deviation is 19.01, over double that of the mean, indicating a large variation in connectedness amongst actors. A small number of highly connected nodes, such as Jeffrey Epstein's 264 or Donald Trump's 143, drag the mean upwards. A more robust picture of the network's connectedness would be the median of 5, indicating that a typical actor in the network is connected to just 5 others.
+
+### Degree Distribution
+
+#### Linear-Linear Scale
+
+```{r degree dist: linear}
+ggplot() + geom_histogram(aes(x=degree(gGC,mode="all"))) + labs(x="Degree",y="Density")
+```
+
+The linear-linear histogram is strongly right-skewed. This means that the vast majority of nodes have very few connections, while there is a small number of high-degree hubs (as we recognized before, nodes like Jeffrey Epstein or Donald Trump). From this plot we cannot see how the hubs are actually distributed along the tail.
+
+#### Log-Log Scale
+
+```{r degree dist: log-log}
+ggplot() + 
+  geom_histogram(aes(x = log10(degree(gGC, mode = "all")))) + 
+  scale_y_log10() +
+  labs(x = "log10(Degree)", y = "log10(Density)")
+```
+
+After applying logarithmic scaling to both degree and density, we can see more clearly the distribution of the hubs. There is a descending pattern in the distribution: a few hubs on the right dominate connectivity, while most nodes have only a few links.
+
+We can conclude that, because of the heterogeneous characteristic of our network, where the maximum degree is over 25 times the mean (8.87), the log-log plot is indispensable to properly characterize and analyze the structure.
+
+## Assortativity
+
+```{r assortativity}
+assortativity_degree(gGC)
+```
+
+The degree assortativity coefficient is **-0.237**. This means that high-degree nodes tend to connect with low-degree nodes rather than to each other. The network is characterized by the domination of a few highly connected brokers, suggesting that high-degree nodes such as Epstein and Trump act as structural bridges, linking subgroups that would otherwise be disconnected. The network is not structured around a small, tightly united elite of mutually connected hubs, rather, these hubs anchor the network individually, each maintaining ties to distinct clusters of lower-degree nodes. This is a network dominated by central intermediaries who largely retain control. 
+
+## Community Detection
+
+To examine the community structure, three community detection methods that are suitable for undirected and weighted networks are utilised: Fast Greedy, Louvain and Label Propagation.
+
+```{r community detection}
+set.seed(1111)
+
+fg_epstein <- cluster_fast_greedy(gGC)
+louvain_epstein <- cluster_louvain(gGC)
+label_prop_epstein <- cluster_label_prop(gGC)
+
+communities_method <- tibble(
+  Method        = c("Fast Greedy", "Louvain", "Label Propagation"),
+  N_communities = c(length(fg_epstein), length(louvain_epstein), length(label_prop_epstein)),
+  Modularity    = c(modularity(fg_epstein), modularity(louvain_epstein), modularity(label_prop_epstein))
+) |>
+  arrange(desc(Modularity))
+
+communities_method
+```
+
+Louvain achieved the highest modularity (0.296) with 13 communities, closely followed by Fast Greedy (0.289) with 15 communities. Both methods detect similar underlying structure, but Louvain performs better in modularity and consolidates the network in few communities. Label Propagation performs poorly, with a modularity of 0.0594, and therefore is not considered a suitable method for our network.
+
+The modularity of 0.296 shows us that the structure of our network is moderate / weak. This is consistent with the earlier findings of the assortativity coefficient, as the dominance of the central hubs softens the boundaries between what could be distinguishable subgroups. In other words, the network has a detectable community structure, but the dominance of hubs prevents communities from being more robustly separated.
+
+```{r Louvain communities}
+V(gGC)$community <- as.factor(membership(louvain_epstein))
+
+Louvain_communities <- ggraph(gGC, layout = "fr") +
+  geom_edge_link(alpha = 0.15, colour = "grey60") +
+  geom_node_point(aes(color = community, size = degree(gGC))) +
+  scale_size(range = c(1, 8)) +
+  geom_node_text(
+    aes(label = ifelse(
+      degree(gGC) > quantile(degree(gGC), 0.95) | name == "Jeffrey Epstein",
+      name, ""
+    )),
+    size = 2.5, repel = TRUE, max.overlaps = Inf
+  ) +
+  theme_graph() +
+  labs(title = "Epstein Network — Louvain Communities",
+       color = "Community", size = "Degree") +
+  theme(legend.position = "right")
+Louvain_communities 
+```
+
+The Louvain plot reveals that the central communities are not spatially well-separated, the dominant hubs sit in the core with overlapping community boundaries. Even if there are communities identified, we can see that these communities are highly concentrated and the distinction between these communities is not absolute. In the periphery however, communities form distinct branches (for example the isolated blue or pink chains on the left edge). 
+
+## Centrality
+
+```{r centrality}
+cent_degree <- degree(gGC, mode = "all")
+cent_degree |>
+  sort(decreasing = TRUE) |>
+  head(5)
+```
+
+```{r betweeness centrality}
+cent_betw   <- betweenness(gGC, weights = NA)
+cent_betw |>
+  sort(decreasing = TRUE) |>
+  head(5)
+```
+
+```{r weighted betweeness}
+cent_betw_w <- betweenness(gGC, weights = E(gGC)$weight)
+cent_betw_w |>
+  sort(decreasing = TRUE) |>
+  head(5)
+```
+
+After computing the degree centrality and betweeness, we can interpret a few things about our network. To begin with, there are some edges in the network that overlap in the three rankings, like Epstein, Trump and Dershowitz. This confirms their central role in the network: they are the most connected actors and the ones with the largest number of shortest possible paths that pass through them.
+
+Epstein ranks first in degree and unweighted betweeness, but drops to second in weighted betweeness. He is displaced by unknown person A, however, this is a composite node containing multiple individuals and therefore he remains the dominant intermediary across all measures, with Trump consistently second and Dershowitz third. In contrast, Obama appears only in the unweighted betweeness, suggesting that he connects distinct subgroups through low-frequency interactions.
+
+As discussed above, "unknown person A" and "unknown person B" are not singular individuals but an amalgamation of many redacted actors and thus, their high centrality and betweeness scores are artificially inflated and cannot be interpreted as a meaningful network property. It does indicate, however that a large part of the network is connected to a redacted individual.
+
+Disregarding the unknown nodes, this information reveals that the operation in the Epstein network was based on the fact that high-profile figures are the visible topology and act as structural bridges. So, the logic of the Epstein network was to organize a small set of central brokers (Epstein, Trump and Dershowitz) that each anchor distinct connected subgroups in the "peripheria".
+
+## Clustering vs. the Configuration Model
+
+```{r clustering coef}
+# Observed clustering coefficient
+observed_cc <- transitivity(gGC, type = "global")
+cat("Observed clustering coefficient:", observed_cc, "\n")
+
+# Clustering coefficient of 1000 random networks with identical configuration models
+n_simulations <- 1000
+random_cc <- numeric(n_simulations)
+
+for (i in 1:n_simulations) {
+  g_random <- rewire(gGC, with = keeping_degseq(niter = ecount(gGC) * 10))
+  random_cc[i] <- transitivity(g_random, type = "global")
+}
+
+# Null distribution vs observed 
+ggplot(data.frame(cc = random_cc), aes(x = cc)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = observed_cc, colour = "red", linewidth = 1.2) +
+  labs(
+    title = "Clustering Coefficient: Observed vs Configuration Model",
+    x = "Clustering Coefficient",
+    y = "Count",
+    caption = "Red line = observed network"
+  ) +
+  theme_minimal()
+
+# P-value — proportion of random networks with clustering >= observed
+p_value <- mean(random_cc >= observed_cc)
+cat("P-value:", p_value, "\n")
+cat("Mean random CC:", mean(random_cc), "\n")
+cat("Observed CC:", observed_cc, "\n")
+```
+
+The clustering coefficient (0.110) is statistically higher than what could be expected from a random distribution (p-value = 0), indicating that the network has more triadic closures than that of a random network. This reveals that the people in Epstein's network tend to know one another, with statistically significant triadic closure present in the network indicating that neighbours of a given actor tend to also be connected to one another. This aligns with the common conception of his network as a close-knit network of elites who frequently intermingle.
+
+## Robustness Check: Filtering Out "Unknown" Nodes
+
+As mentioned, nodes labeled as "unknown person", "unknown person A", "unknown person B", etc. are a composition of different people, which inflates the apparent degree and centrality of these nodes.
+
+To check how much this distorts our results, we rebuild the network excluding any node whose name matches the pattern "unknown" and recompute the centrality measures and community structure. We decided to keep the entities such as China, FBI, United States, because even if they are not individual persons, they are an identified actor in the network.
+
+```{r robustness-filter}
+# Identify nodes containing "unknown" (case-insensitive)
+unknown_nodes <- V(gGC)$name[grepl("unknown", V(gGC)$name, ignore.case = TRUE)]
+cat("Removing", length(unknown_nodes), "nodes matching 'unknown':\n")
+print(unknown_nodes)
+
+# Build filtered graph
+gGC_filtered <- delete_vertices(gGC, unknown_nodes)
+
+# Keep only the giant component of the filtered graph
+gGC_filtered <- decompose(gGC_filtered)[[1]]
+
+# Compare sizes
+data.frame(
+  Network  = c("Full (with unknowns)", "Filtered (identified only)"),
+  Nodes    = c(vcount(gGC), vcount(gGC_filtered)),
+  Edges    = c(ecount(gGC), ecount(gGC_filtered)),
+  Mean_Deg = c(round(mean(degree(gGC)), 2), round(mean(degree(gGC_filtered)), 2)),
+  SD_Deg   = c(round(sd(degree(gGC)), 2),   round(sd(degree(gGC_filtered)), 2))
+) |>
+  kable(caption = "Network size before and after removing 'unknown' nodes") |>
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+```{r robustness-centrality}
+# Top 5 by degree
+top_deg <- sort(degree(gGC_filtered), decreasing = TRUE)[1:5]
+
+# Top 5 by betweenness
+top_btw <- sort(betweenness(gGC_filtered, normalized = TRUE), decreasing = TRUE)[1:5]
+
+data.frame(
+  Rank = 1:5,
+  Top_by_Degree      = names(top_deg),
+  Degree             = as.integer(top_deg),
+  Top_by_Betweenness = names(top_btw),
+  Betweenness        = unname(round(top_btw, 4))
+) |>
+  kable(caption = "Top 5 nodes in the filtered (identified-only) network") |>
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+```{r robustness-communities}
+# Rerun Louvain on the filtered network
+set.seed(111)
+comm_filtered <- cluster_louvain(gGC_filtered)
+
+cat("Number of communities:", length(comm_filtered), "\n")
+cat("Modularity:", round(modularity(comm_filtered), 4), "\n")
+cat("Community sizes:\n")
+print(sizes(comm_filtered))
+```
+
+### Discussion
+
+After removing the 23 "unknown" nodes, the filtered network contains 423 nodes and 1,596 edges. Notably, these 23 nodes (5% of the network) accounted for 21% of all edges, confirming that they have an important impact in our network. The mean degree drops from 8.87 to 7.55 and the standard deviation drops from 19.01 to 15.44, indicating a less skewed degree distribution once this nodes are excluded. The centrality rankings change in informative ways. In the filtered network, Jeffrey Epstein is the clear top hub by degree, followed by Donald Trump and Alan Dershowitz. The betweenness ranking tells a different story: Trump ranks first, above Epstein. This asymmetry suggests that while Epstein is the most connected individual, Trump plays a stronger structural role, linking parts of the network that would otherwise be less connected. Alan Dershowitz appears in the top 3 of both rankings, consistent with his central role in the legal proceedings. "United States" ranks in the top 5 for betweenness but not degree. Louvain detects 15 communities in the filtered network (vs. 13 in the full network) with modularity 0.3065, a moderate value. The fact that removing the composite unknowns produces more communities is revealing: the unknown nodes were acting as bridges that forced distinct subgroups into shared communities. Once removed, these subgroups separate, producing a slightly finer but still moderately modular partition. Overall, the robustness check suggests that the qualitative conclusions from the full network hold, like Epstein, Trump and Dershowitz remain central, but the unknowns were absorbing a share of connectivity and slightly affecting the community structure.
+
+Nevertheless, we must once again acknowledge a possibility of bias: the "unknown" label often corresponds to victims and less-public individuals whose identities were legally redacted, so by removing them we are also discarding real structural information about the network. This means that neither the full nor the filtered network represents the "full truth": the full network is distorted by the unknowns, while the filtered network is skewed toward public figures. Given the data available, we have aimed to be as meticulous and methodologically transparent as possible.
+
+## References
+
+Andrews, M. (2025). Epstein-doc-explorer: a graph explorer of the Epstein emails \[Dataset\]. In GitHub. https://github.com/maxandrews/Epstein-doc-explorer

@@ -1,0 +1,16 @@
+project:
+  type: website
+
+website:
+  title: "Epstein Files Network Analysis"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Home
+      - href: 01-network-exploration.qmd
+      - href: 02-link-prediction.qmd
+      - href: 03-diffusion-modelling.qmd
+
+format:
+  html:
+    embed-resources: true

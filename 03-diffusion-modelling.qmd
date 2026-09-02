@@ -1,0 +1,592 @@
+---
+title: "Diffusion Modelling"
+author: "Clare McGarvey, Paloma Navarro and Anita Di Gennaro"
+---
+
+## Introduction
+
+This analytical section focuses on the spread of information through the Epstein network using a Susceptible-Infected-Recovered (SIR) framework. We derive the network's theoretical epidemic threshold, simulate spread above and below it, and test the effect of targeted interventions. These interventions examine targeting seeds or suppressing spreaders by centrality, rather than at random, and found that how far and how fast information spreads through the network can be highly influenced. 
+
+This file uses the same network constructed in Link Prediction, drawing from the top 1,700 nodes and examining the giant component. As before, entities with "unknown" composite nodes are removed as their inflated connectivity would distort results. 
+
+## Data Preparation
+
+```{r setup}
+#| results: 'hide'
+#| message: false
+#| warning: false
+source("data-prep.R")
+library(purrr)
+library(tibble)
+```
+
+## Network Construction
+
+```{r construct-network}
+edgelist <- raw[, c("actor", "target")]
+
+entity_freq <- table(c(edgelist$actor, edgelist$target))
+top1700       <- names(sort(entity_freq, decreasing = TRUE))[1:1700]
+
+edgelist <- edgelist[edgelist$actor %in% top1700 & edgelist$target %in% top1700, ]
+
+# Build and simplify 
+epstein <- graph.data.frame(edgelist, directed = FALSE)
+epstein <- igraph::simplify(epstein)
+epstein
+
+# Filter out "unknown" composite nodes 
+unknown_nodes <- V(epstein)$name[grepl("unknown", V(epstein)$name, ignore.case = TRUE)]
+cat("Removing", length(unknown_nodes), "unknown composite nodes\n")
+epstein <- delete_vertices(epstein, unknown_nodes)
+
+# Take the giant component
+epstein <- decompose(epstein)[[which.max(sapply(decompose(epstein), vcount))]]
+
+# Node and Edges Count
+cat("Nodes:", vcount(epstein), "\n")
+cat("Edges:", ecount(epstein), "\n")
+```
+## The SIR Model
+
+```{r sir-model-function}
+# 0 = Susceptible, 1 = Infected, 2 = Recovered
+sim_sir <- function(g, beta, mu, seeds){
+  state <- rep(0, vcount(g))
+  state[seeds] <- 1
+  t <- 0
+  table <- data.frame(t = 0, inf = seeds)
+  while(sum(state == 1) > 0){
+    t <- t + 1
+    infected <- which(state == 1)
+    state[infected] <- ifelse(runif(length(infected)) < mu, 2, 1)
+
+    infected    <- which(state == 1)
+    susceptible <- which(state == 0)
+    contacts <- as.numeric(unlist(adjacent_vertices(g, infected)))
+    contacts <- contacts[contacts %in% susceptible]
+    new_infected <- unique(contacts[runif(length(contacts)) < beta])
+    if(length(new_infected) > 0){
+      state[new_infected] <- 1
+      table <- rbind(table, data.frame(t, inf = new_infected))
+    }
+  }
+  table
+}
+```
+
+## Simulation Helpers
+
+```{r simulation-helpers}
+N_RUNS <- 50
+
+sim_sir_novax <- function(g, beta, mu, seeds, no_spread = c()) {
+  state <- rep(0, vcount(g))
+  state[seeds] <- 1
+  t <- 0
+  table <- data.frame(t = 0, inf = seeds)
+  while (sum(state == 1) > 0) {
+    t <- t + 1
+    infected <- which(state == 1)
+    state[infected] <- ifelse(runif(length(infected)) < mu, 2, 1)
+
+    infected    <- which(state == 1)
+    spreaders   <- infected[!infected %in% no_spread]
+    susceptible <- which(state == 0)
+    contacts <- as.numeric(unlist(adjacent_vertices(g, spreaders)))
+    contacts <- contacts[contacts %in% susceptible]
+    new_infected <- unique(contacts[runif(length(contacts)) < beta])
+    if (length(new_infected) > 0) {
+      state[new_infected] <- 1
+      table <- rbind(table, data.frame(t, inf = new_infected))
+    }
+  }
+  table
+}
+
+avg_sim <- function(g, beta, mu, n_seeds, n_runs = N_RUNS, no_spread = c()) {
+  map_dfr(seq_len(n_runs), function(i) {
+    seeds <- sample(seq_len(vcount(g)), n_seeds)
+    sim_sir_novax(g, beta, mu, seeds, no_spread) |>
+      group_by(t) |>
+      summarise(ninf = n(), .groups = "drop") |>
+      mutate(run = i)
+  })
+}
+
+per_run_stats <- function(runs_df) {
+  runs_df |>
+    group_by(run) |>
+    summarise(total = sum(ninf), peak_t = t[which.max(ninf)], .groups = "drop")
+}
+
+avg_total <- function(s) round(mean(s$total))
+avg_peak  <- function(s) round(mean(s$peak_t))
+```
+
+## Epidemic Threshold
+
+Find the theoretical epidemic threshold for βc your network for the information to reach a significant number of nodes.
+
+Firstly, the theoretical epidemic threshold (βc) of the Epstein network is found. 
+
+
+```{r}
+# Theoretical epidemic threshold
+mu    <- 0.1
+kavg  <- mean(degree(epstein))
+ksq   <- mean(degree(epstein)^2)
+betac <- mu * kavg / (ksq - kavg)
+
+cat("<k>:   ", kavg, "\n")
+cat("<k^2>: ", ksq, "\n")
+cat("kappa: ", ksq/kavg, "\n")
+cat("mu:    ", mu, "\n")
+cat("beta_c:", betac, "\n")
+```
+
+The average degree of the network is 6.87, suggesting that a node (person) in the Epstein files is directly connected to roughly seven others, and that information does not spread as fast as might be expected.
+
+The branching factor is a significantly higher number (68.4), as Epstein himself, Donald Trump, Alan Dershowitz, and a handful of other important actors in the network are vastly more connected than the average node (refer to Network Exploration). Therefore, any random person who received information is far more likely to have received it from one of those main hubs, rather than from a peripheral contact.
+
+βc represents the probability that an infected person infects a specific neighbor in one step, and in this context the threshold returns as a very small number. The branching factor's value resonates with this low transmission probability of approximately 0.14%: the network is hub-dominated, meaning certain elements have a much stronger infecting power than others.
+
+## Simulating Spread Above and Below Threshold
+
+Using a randomly selected 1% of initial spreaders, we simulate the SIR model for a range below and above the theoretical threshold βc found above and plot total infections as a function of β.  
+
+```{r simulation-range}
+set.seed(2406)
+
+# One realization at β = 0.015
+seeds <- sample(1:vcount(epstein), vcount(epstein) * 0.01)
+realization <- sim_sir(epstein, beta = 0.015, mu = 0.1, seeds = seeds)
+
+# Infection curve over time
+realization |> group_by(t) |> summarise(ninf = n()) |>
+  ggplot(aes(x = t, y = ninf)) + geom_line() +
+  labs(x = "Time step", y = "New infections",
+       title = "SIR infection curve at \u03b2 = 0.015")
+
+# Results + visualization
+results <- map_dfr(seq(0, 0.03, 0.001),   # beta range adapted to our β
+        \(beta){
+          seeds       <- sample(1:vcount(epstein), vcount(epstein) * 0.01)
+          realization <- sim_sir(epstein, beta, mu, seeds)
+          data.frame(beta, ninf = nrow(realization))
+        })
+
+results |> ggplot(aes(x = beta, y = ninf)) + 
+  geom_point() +
+  geom_vline(xintercept = betac, linetype = 2) +
+  labs(x = expression(beta), y = "Total infected",
+       title = "Final outbreak size vs. \u03b2 (random 1% seeds, \u03bc = 0.1)")
+
+```
+
+The first plot shows a single realization where β = 0.015 (approximately 10 times above the theoretical threshold). The infection curve shows an initial peak, followed by a series of about 25 time steps, during which there are minimal new infections. After this initial delay, the information starts to spread again, with new staggered infections. This suggests that the infection really only begins once one of the main actors (e.g. Epstein or Maxwell) are reached, propagating the 'news'. This is in line with the behavior of hub-dominated networks, such as the Epstein files. Over time, the infection curve starts to die out, as the main hubs are informed.
+
+By displaying the total number of infected nodes as a function of β, with βc signaled through the vertical dotted line, it can be noticed that for β above βc (the threshold) the infection starts to steeply spread. It eventually grows to reach 600-800 infected nodes. Overall, the main conclusion from this visualization is that the point where information goes from *dying out* to *spreading across the network* corresponds to the theoretical threshold previously calculated.
+
+## Targeted vs. Random Seeding
+
+To compare targeted and random seeding, a β of approximately 30 times the threshold (0.05) was selected to ensure the outbreak takes off in every run and the observed difference can be attributed to the seeding strategy. Firstly, the centrality measure that best predicts early infection is identified, through a comparison of infection times between degree, closeness, betweenness, and page rank. Secondly, the best measure is then taken and the top 1% of nodes are selected as the targeted seed set. The difference between random selection and the targeted selection is examined through both the total number of infections and the difference in the infection peak. 
+
+```{r centrality-correlation}
+set.seed(2406)
+beta <- 0.05
+
+# One SIR realization with 1% random seeds to get time of infection per node
+seeds <- sample(1:vcount(epstein), vcount(epstein) * 0.01)
+realization <- sim_sir(epstein, beta = beta, mu = mu, seeds = seeds)
+
+# Merge centralities with infection times
+table_d  <- data.frame(inf = seq_len(vcount(epstein)), degree = as.numeric(degree(epstein))) |> merge(realization)
+table_c  <- data.frame(inf = seq_len(vcount(epstein)), closeness = as.numeric(closeness(epstein))) |> merge(realization)
+table_pr <- data.frame(inf = seq_len(vcount(epstein)), page_rank = as.numeric(page_rank(epstein)$vector)) |> merge(realization)
+table_b  <- data.frame(inf = seq_len(vcount(epstein)), betweenness = as.numeric(betweenness(epstein))) |> merge(realization)
+
+table3 <- table_d |> merge(table_c) |> merge(table_pr) |> merge(table_b)
+cor(table3$t, table3[, -c(1, 2)])
+```
+
+All the centrality measures are negative, which is reasonable, since the network is hub-centered and the more central a node is, the earlier it is expected to be infected. Here, the stronger metric is the *closeness*.
+
+```{r targeted-seeding-simulation}
+set.seed(2406)
+n_seeds <- round(vcount(epstein) * 0.01)
+
+# Centrality-based seeds (1%) using closeness
+seeds_centrality <- closeness(epstein) |>
+  enframe(name = "inf", value = "closeness") |>
+  slice_max(closeness, n = n_seeds)
+
+# Convert character node names to integer vertex IDs for sim_sir
+seeds_centrality_ids <- match(seeds_centrality$inf, V(epstein)$name)
+
+# Helper: average N_RUNS simulations from a FIXED seed set
+avg_sim_fixed_seeds <- function(g, beta, mu, seeds, n_runs = N_RUNS) {
+  map_dfr(seq_len(n_runs), function(i) {
+    sim_sir(g, beta, mu, seeds) |>
+      group_by(t) |>
+      summarise(ninf = n(), .groups = "drop") |>
+      mutate(run = i)
+  })
+}
+
+# Random seeding
+runs_random_seed  <- avg_sim(epstein, beta, mu, n_seeds)
+curve_random_seed <- runs_random_seed |> group_by(t) |> summarise(ninf = mean(ninf), .groups = "drop")
+
+# Targeted seeding
+runs_targeted_seed  <- avg_sim_fixed_seeds(epstein, beta, mu, seeds_centrality_ids)
+curve_targeted_seed <- runs_targeted_seed |> group_by(t) |> summarise(ninf = mean(ninf), .groups = "drop")
+
+ggplot() +
+  geom_line(data = curve_random_seed,   aes(x = t, y = ninf, col = "Random")) +
+  geom_line(data = curve_targeted_seed, aes(x = t, y = ninf, col = "Targeted")) +
+  labs(x = "Time step", y = "Mean new infections",
+       title = paste0("Infection curves: random vs. centrality-based seeds\n(\u03b2 = 0.05, mean over ", N_RUNS, " runs)"),
+       color = "Seeding strategy")
+```
+
+```{r targeted-seeding-metrics}
+stats_random_seed   <- per_run_stats(runs_random_seed)
+stats_targeted_seed <- per_run_stats(runs_targeted_seed)
+
+cat("Avg total infected (random):   ", avg_total(stats_random_seed),   "\n")
+cat("Avg total infected (targeted): ", avg_total(stats_targeted_seed), "\n")
+cat("Difference:", avg_total(stats_targeted_seed) - avg_total(stats_random_seed), "\n\n")
+
+cat("Avg peak time (random):   ", avg_peak(stats_random_seed),   "\n")
+cat("Avg peak time (targeted): ", avg_peak(stats_targeted_seed), "\n")
+cat("Difference:", avg_peak(stats_targeted_seed) - avg_peak(stats_random_seed), "\n\n")
+
+cat("SD (random):    ",sd(stats_random_seed$total), "\n")
+cat("SD (targeted):  ",sd(stats_targeted_seed$total), "\n")
+```
+
+Averaged over 50 runs, the total infected nodes is almost indistinguishable between targeted and random seeding (967 vs. 983) as the 16 node gap is small relative to the run-to-run variability of the simulation (SD ≈ 74–80 nodes per scenario). At this large β (0.05, roughly 30 times βc), the seeding strategy has no detectable effect on the total infections and the infection spreads easily enough that both strategies reach around two-thirds of the network, so the difference between targeted and randomized infected is not as striking as expected.
+
+In contrast, the peak time of infection is now reached earlier in the targeted case compared to the randomized one, peaking four time steps sooner (t = 3 vs t = 7). This behavior can also be seen in the graph, where the targeted curve rises and peaks before the random one.
+
+Ultimately, choosing seeds by the strongest centrality measure for the network, here closeness, shows that whilst targeted infection has a negligible effect on total infections, it peaks four time steps earlier than the random one, indicating that the information spreads faster. Centrality thus matters more for speed of transmission, rather than scale, when the network is well above its epidemic threshold. 
+
+## A Quarantine Strategy
+
+Using the same β, a "quarantine strategy" will be designed, where 20% of the susceptible population are quarantined during the exponential growth phase. These quarantined nodes are then released 8 time steps later, where they are newly susceptible. 
+
+```{r finding-exponential-growth}
+set.seed(2406)
+beta_val <- 0.1
+mu_val   <- 0.1
+
+pilot_seeds <- sample(seq_len(vcount(epstein)), round(vcount(epstein) * 0.01))
+pilot       <- sim_sir(epstein, beta = beta_val, mu = mu_val, pilot_seeds) |>
+  group_by(t) |> summarise(ninf = n(), .groups = "drop")
+
+ggplot(pilot, aes(x = t, y = ninf)) +
+  geom_line() + geom_point() +
+  scale_y_log10() +
+  labs(x = "Time step", y = "New infections (log scale)",
+       title = "Pilot SIR run: identifying exponential growth phase",
+       subtitle = "Straight line on log scale = exponential growth")
+
+# Growth rate between consecutive time steps
+pilot <- pilot |>
+  mutate(growth_rate = ninf / lag(ninf))
+
+print(pilot)
+
+# Determine quarantine timing from pilot
+t_start <- pilot$t[which.max(pilot$growth_rate[-1]) + 1]
+t_end   <- t_start + 8
+cat("Quarantine begins at t =", t_start, "\n")
+cat("Quarantine ends   at t =", t_end,   "\n")
+```
+
+```{r quarantine-function}
+# SIM-SIR model 
+sim_sir_quarantine <- function(g, beta, mu, seeds, t_quarantine, quarantine_duration = 8, quarantine_frac = 0.20){
+  state <- rep(0, vcount(g)) # 0: Susceptible, 1: Infected, 2: Recovered, 3: Quarantined
+  state[seeds] <- 1
+  t <- 0
+  table <- data.frame(t=0, inf=seeds)
+  quarantined_nodes <- c()
+  
+  while(sum(state==1) > 0){
+    t <- t + 1
+    
+    if(t == t_quarantine){
+      susceptible <- which(state == 0)
+      n_quarantine <- floor(length(susceptible) * quarantine_frac)
+      if(n_quarantine > 0){
+        quarantined_nodes <- sample(susceptible, n_quarantine)
+        state[quarantined_nodes] <- 3
+      }
+    }
+    
+    ## I -> R
+    infected <- which(state==1)
+    state[infected] <- ifelse(runif(length(infected)) < mu, 2, 1)
+
+    ## S -> I
+    infected     <- which(state==1)
+    susceptible  <- which(state==0)
+    contacts     <- as.numeric(unlist(adjacent_vertices(g, infected)))
+    contacts     <- contacts[contacts %in% susceptible]
+    new_infected <- unique(contacts[runif(length(contacts)) < beta])
+
+    if(length(new_infected) > 0){
+     state[new_infected] <- 1
+     table <- rbind(table, data.frame(t, inf=new_infected))
+    }
+
+    # Release quarantine after infection step so released nodes
+    # can only be infected from t+1 onwards
+    if(t == (t_quarantine + quarantine_duration)){
+     state[quarantined_nodes] <- 0
+    }
+  }
+  table
+}
+
+avg_sim_quarantine <- function(g, beta, mu, n_seeds, n_runs = N_RUNS,
+                                t_quarantine, quarantine_duration = 8, quarantine_frac = 0.20) {
+  map_dfr(seq_len(n_runs), function(i) {
+    seeds <- sample(seq_len(vcount(g)), n_seeds)
+    sim_sir_quarantine(g, beta, mu, seeds, t_quarantine, quarantine_duration, quarantine_frac) |>
+      group_by(t) |> summarise(ninf = n(), .groups = "drop") |> mutate(run = i)
+  })
+}
+```
+
+```{r quarantine-simulation}
+set.seed(2406)
+n_seeds_q4 <- round(vcount(epstein) * 0.01)
+
+runs_normal     <- avg_sim(epstein, beta_val, mu_val, n_seeds_q4)
+runs_quarantine <- avg_sim_quarantine(epstein, beta_val, mu_val, n_seeds_q4, t_quarantine = t_start)
+
+curve_normal     <- runs_normal     |> group_by(t) |> summarise(ninf = mean(ninf), .groups = "drop")
+curve_quarantine <- runs_quarantine |> group_by(t) |> summarise(ninf = mean(ninf), .groups = "drop")
+
+ggplot() +
+  geom_line(data = curve_normal,     aes(x = t, y = ninf, col = "No Quarantine")) +
+  geom_line(data = curve_quarantine, aes(x = t, y = ninf, col = "Quarantine 20%")) +
+  geom_vline(xintercept = t_start, linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = t_end,   linetype = "dashed", colour = "grey40") +
+  annotate("text", x = t_start + 0.2, y = Inf,
+           label = "Quarantine\nbegins", vjust = 1.5, hjust = 0, size = 3, colour = "grey40") +
+  annotate("text", x = t_end + 0.2, y = Inf,
+           label = "Quarantine\nends", vjust = 1.5, hjust = 0, size = 3, colour = "grey40") +
+  labs(y = "Mean new infections", x = "Time",
+       title = paste0("Effect of Quarantine Strategy (mean over ", N_RUNS, " runs)"),
+       colour = "Scenario")
+
+stats_q4_normal     <- per_run_stats(runs_normal)
+stats_q4_quarantine <- per_run_stats(runs_quarantine)
+
+# Metrics
+cat("── Average total infected ──────────────────────────\n")
+cat("No quarantine:  ", avg_total(stats_q4_normal), "\n")
+cat("Quarantine 20%: ", avg_total(stats_q4_quarantine), "\n\n")
+
+cat("── Difference vs. no-quarantine ────────────────────\n")
+cat("Quarantine 20%: ", avg_total(stats_q4_quarantine) - avg_total(stats_q4_normal),
+    sprintf("(%.1f%%)\n\n", 100 * (avg_total(stats_q4_quarantine) - avg_total(stats_q4_normal)) / avg_total(stats_q4_normal)))
+
+cat("── Average peak time ───────────────────────────────\n")
+cat("No quarantine:  ", mean(stats_q4_normal$peak_t),     "\n")
+cat("Quarantine 20%: ", mean(stats_q4_quarantine$peak_t), "\n\n")
+
+cat("── Difference in peak time vs. no-quarantine ───────\n")
+diff_peak <- mean(stats_q4_quarantine$peak_t) - mean(stats_q4_normal$peak_t)
+cat("Quarantine 20%: ", round(diff_peak, 2),
+    sprintf("(%.1f%%)\n", 100 * diff_peak / mean(stats_q4_normal$peak_t)))
+```
+
+On average, introducing a quarantine of 20% of the population lowers the total infections by 2.1%. With no quarantine the initial peak results in the highest number of new infections and then trends downwards. When there's a quarantine, on average, a second peak is created once the quarantined group is let out. This peak is not as intense as the first and the infections trend downwards from there. Additionally, introducing a quarantine delayed the peak by t = 0.7. 
+
+## Suppressing Spread
+
+We now examine how the spread of information is effected when a set of actors are prevented from passing it on. Rather than removing nodes, we simulate 'silent' nodes who can receive the information but not share it. Two methods of silent node selection are compared: A) random selection, B) targeting actors with the highest closeness centrality. As each simulation is stochastic, we average results over 50 independent runs per scenario to find the trend for each and enable a stable comparison. 
+
+```{r suppression-simulation}
+set.seed(2406)
+n_seeds_full <- round(vcount(epstein) * 0.01)
+runs_normal_5  <- avg_sim(epstein, beta_val, mu_val, n_seeds_full)
+curve_normal_5 <- runs_normal_5 |> group_by(t) |> summarise(ninf = mean(ninf), .groups = "drop")
+
+# Random 5% silenced — pass indices via no_spread instead of deleting them
+vax_random  <- sample(seq_len(vcount(epstein)), round(vcount(epstein) * 0.05))
+runs_random  <- avg_sim(epstein, beta_val, mu_val, n_seeds_full, no_spread = vax_random)
+curve_random <- runs_random |> group_by(t) |> summarise(ninf = mean(ninf), .groups = "drop")
+
+# Targeted (closeness) 5% silenced
+vax_centrality_names <- closeness(epstein) |>
+  enframe(name = "inf", value = "closeness") |>
+  slice_max(closeness, n = round(vcount(epstein) * 0.05)) |>
+  pull(inf)
+
+# closeness() returns names; no_spread compares against numeric vertex indices
+vax_centrality <- match(vax_centrality_names, V(epstein)$name)
+
+runs_central  <- avg_sim(epstein, beta_val, mu_val, n_seeds_full, no_spread = vax_centrality)
+curve_central <- runs_central |> group_by(t) |> summarise(ninf = mean(ninf), .groups = "drop")
+
+ggplot() +
+  geom_line(data = curve_normal_5, aes(x = t, y = ninf, col = "No Suppression")) +
+  geom_line(data = curve_random,   aes(x = t, y = ninf, col = "Random 5% Suppression")) +
+  geom_line(data = curve_central,  aes(x = t, y = ninf, col = "Targeted 5% Suppression")) +
+  labs(y = "Mean new infections", x = "Time",
+       title = paste0("Random vs. Targeted Information Suppression\n(mean over ", N_RUNS, " runs)"),
+       color = "Scenario")
+
+stats_normal_5 <- per_run_stats(runs_normal_5)
+stats_random   <- per_run_stats(runs_random)
+stats_central  <- per_run_stats(runs_central)
+
+cat("── Average total infected ──────────────────────────\n")
+cat("No suppression:            ", avg_total(stats_normal_5),  "\n")
+cat("Random 5% suppression:     ", avg_total(stats_random),  "\n")
+cat("Targeted 5% suppression:   ", avg_total(stats_central), "\n\n")
+
+cat("── Difference vs. no-suppression ───────────────────────\n")
+cat("Random suppression:        ", avg_total(stats_random)  - avg_total(stats_normal_5),
+    sprintf("(%.1f%%)\n", 100 * (avg_total(stats_random)  - avg_total(stats_normal_5)) / avg_total(stats_normal_5)))
+cat("Targeted suppression:      ", avg_total(stats_central) - avg_total(stats_normal_5),
+    sprintf("(%.1f%%)\n", 100 * (avg_total(stats_central) - avg_total(stats_normal_5)) / avg_total(stats_normal_5)))
+cat("Targeted vs. random:   ", avg_total(stats_central) - avg_total(stats_random),
+    sprintf("(%.1f%%)\n\n", 100 * (avg_total(stats_central) - avg_total(stats_random)) / avg_total(stats_random)))
+
+cat("── Average peak time ───────────────────────────────\n")
+cat("No suppression:            ", avg_peak(stats_normal_5),  "\n")
+cat("Random 5% suppression:     ", avg_peak(stats_random),  "\n")
+cat("Targeted 5% suppression:   ", avg_peak(stats_central), "\n\n")
+
+cat("── Difference in peak time vs. no-suppression ──────────\n")
+cat("Random suppression:        ", avg_peak(stats_random)  - avg_peak(stats_normal_5),
+    sprintf("(%.1f%%)\n", 100 * (avg_peak(stats_random)  - avg_peak(stats_normal_5)) / avg_peak(stats_normal_5)))
+cat("Targeted suppression:      ", avg_peak(stats_central) - avg_peak(stats_normal_5),
+    sprintf("(%.1f%%)\n", 100 * (avg_peak(stats_central) - avg_peak(stats_normal_5)) / avg_peak(stats_normal_5)))
+cat("Targeted vs. random:   ", avg_peak(stats_central) - avg_peak(stats_random),
+    sprintf("(%.1f%%)\n", 100 * (avg_peak(stats_central) - avg_peak(stats_random)) / avg_peak(stats_random)), "\n\n")
+
+cat("── Standard deviation (total infected) ──────────────────\n")
+cat("No suppression:             ", sd(stats_normal_5$total), "\n")
+cat("Random suppression:         ", sd(stats_random$total),   "\n")
+cat("Targeted suppression:       ", sd(stats_central$total),  "\n\n")
+
+cat("── Standard deviation (peak time) ────────────────────────\n")
+cat("No suppression:             ", sd(stats_normal_5$peak_t), "\n")
+cat("Random suppression:         ", sd(stats_random$peak_t),   "\n")
+cat("Targeted suppression:       ", sd(stats_central$peak_t),  "\n")
+```
+
+On average, randomly suppressing 5% of the population from spreading information results in a similar transmission pattern as no suppression, albeit with a slight reduction (1.5%) in total infections that mostly occurs at the peak. Both the no-suppression and random 5% suppression peak quite quickly, on average, at t = 5. In comparison, targeting the suppression results in a much greater reduction in total infections (34.4% less than no suppression, 33.3% less than random suppression), and the peak is pushed until much later, to t = 19 on average, 14 steps later than either no or random suppression. This indicates that silencing highly connected hub nodes is far more effective at containing the spread of information that randomly silencing the same number of nodes, consistent with the network's hub-dominated structure as described above. 
+
+This suggests that those key nodes such as Epstein, Trump and Dershowitz have structural power over the spread of  information through the network.  
+
+## Comparing Targeted Seeding and Targeted Suppression
+
+When finding a targeted seed, we used closeness centrality to identify the 1% of nodes that would maximise information spread when used as seeds. Average over 50 runs, targeting seeding had a negligible effect on total infections when compared to random selection (967 vs. 983), but the peak of infection arrived four time steps earlier (t = 3 vs. t = 7). On the other hand, we also used closeness but in the opposite direction: to identify the 5% of nodes whose silencing would most effectively block the spread. The targeted suppression reduced total infections by 34.4% relative to no intervention and 33.3% relative to random suppression, and it delayed the peak from t = 5 to t = 19.
+
+The same nodes are the ones that drive both effects: In targeted seeding, closeness identifies the best positioned to _quickly_ push information across the network (Trump, Epstein, Dershowitz etc.), even though it does not change how far that information ultimately reaches. In targeted suppression, the algorithm flags the same actors as the most damaging to silence, because of them being bridges through which information would flow. The hubs that accelerate the diffusion when activated are the same ones that paralyse diffusion when silenced. 
+
+We can understand the symmetry based not only on the findings of this file, but also based on the ones before. The heavily skewed degree distribution and the dominance of a handful high-degree actors that we documented previously help us understand these findings. In our network, where most pathways of information run through only a small set of central nodes, interventions that target these nodes will outperform random strategies. By touching the main central nodes with targeted interventions, we concentrate the effort where the network's structure will notice the impact.
+
+In the Epstein network, the small set of high centrality actors hold disproportionate power over how information moves through the network. They could spread a narrative very fast if coordinated and block effectively if they stay silent. The behavior of the rest of the network relies heavily on what Trump, Epstein, Dershowitz and other central actors do. This gives insight into how a small number of well-connected actors have a large, structural influence over which information moves through the network. 
+
+## A Predictive Model for Seeding and Suppression
+
+Rather than relying on a single centrality measure, we train a model to predict each node's time-to-infection from several structural features simultaneously, including degree, closeness, betweeness and page rank. The predictions of that model are then used to select seeds and suppression targets. 
+
+```{r train-time-to-infection-model}
+set.seed(2406)
+# Train data
+seeds_train <- sample(seq_len(vcount(epstein)), round(vcount(epstein) * 0.01))
+realization_train <- sim_sir(epstein, beta = beta_val, mu = mu_val,
+                             seeds = seeds_train)
+
+# Per-node time of infection 
+node_times <- realization_train |>
+  group_by(inf) |>
+  summarise(t = min(t), .groups = "drop")
+
+# Centrality predictors
+predictors <- data.frame(
+  inf         = seq_len(vcount(epstein)),
+  degree      = as.numeric(degree(epstein)),
+  closeness   = as.numeric(closeness(epstein)),
+  betweenness = as.numeric(betweenness(epstein)),
+  page_rank   = as.numeric(page_rank(epstein)$vector)
+)
+
+# Merge: only nodes that got infected appear in the training data
+train_data <- merge(predictors, node_times, by = "inf")
+
+# Training the linear model
+fit <- lm(t ~ degree + closeness + betweenness + page_rank, data = train_data)
+summary(fit)
+```
+
+```{r predicted-seeds-and-suppression}
+# Predict time-to-infection for ALL nodes including never-infected ones
+predictors$predicted_t <- predict(fit, newdata = predictors)
+# Smallest predicted t = nodes that should get infected earliest = strongest spreaders
+head(predictors[order(predictors$predicted_t), ], 10)
+
+# Scenario (c): seeds chosen by smallest predicted t (maximise spread)
+set.seed(2406)
+n_seeds <- round(vcount(epstein) * 0.01)
+seeds_model <- predictors[order(predictors$predicted_t), "inf"][seq_len(n_seeds)]
+
+runs_seeds_model <- map_dfr(seq_len(N_RUNS), function(i){
+  sim_sir(epstein, beta_val, mu_val, seeds_model) |>
+    group_by(t) |> summarise(ninf = n(), .groups = "drop") |> mutate(run = i)
+})
+curve_seeds_model <- runs_seeds_model |> group_by(t) |> summarise(ninf = mean(ninf), .groups = "drop")
+
+# Scenario (d): silence 5% with smallest predicted t, then 1% random seeds
+n_vax <- round(vcount(epstein) * 0.05)
+vax_model <- predictors[order(predictors$predicted_t), "inf"][seq_len(n_vax)]
+
+n_seeds_vax <- round(vcount(epstein) * 0.01)
+runs_vax_model <- avg_sim(epstein, beta_val, mu_val, n_seeds_vax, no_spread = vax_model)
+curve_vax_model <- runs_vax_model |> group_by(t) |> summarise(ninf = mean(ninf), .groups = "drop")
+```
+
+```{r four-scenario-comparison}
+ggplot() +
+  geom_line(data = curve_normal_5,    aes(x = t, y = ninf, col = "(a) Random seeds")) +
+  geom_line(data = curve_random,      aes(x = t, y = ninf, col = "(b) Random 5% suppression")) +
+  geom_line(data = curve_seeds_model, aes(x = t, y = ninf, col = "(c) Model-selected seeds")) +
+  geom_line(data = curve_vax_model,   aes(x = t, y = ninf, col = "(d) Model-selected suppression")) +
+  labs(y = "Mean new infections", x = "Time",
+       title = paste0("Model-based vs. random seeding and suppression\n(mean over ", N_RUNS, " runs)"),
+       color = "Scenario")
+
+stats_seeds_model <- per_run_stats(runs_seeds_model)
+stats_vax_model   <- per_run_stats(runs_vax_model)
+
+cat("── Average total infected ──────────────────────────\n")
+cat("(a) Random seeds:                 ", avg_total(stats_normal_5),    "\n")
+cat("(b) Random 5% suppression:        ", avg_total(stats_random),      "\n")
+cat("(c) Model-selected seeds:         ", avg_total(stats_seeds_model), "\n")
+cat("(d) Model-selected suppression:   ", avg_total(stats_vax_model),   "\n\n")
+
+cat("── Average peak time ───────────────────────────────\n")
+cat("(a) Random seeds:                 ", avg_peak(stats_normal_5),    "\n")
+cat("(b) Random 5% suppression:        ", avg_peak(stats_random),      "\n")
+cat("(c) Model-selected seeds:         ", avg_peak(stats_seeds_model), "\n")
+cat("(d) Model-selected suppression:   ", avg_peak(stats_vax_model),   "\n")
+```
+
+We trained a linear model to predict each node's time-to-infection using degree, closeness, betweeness and page rank, from one random-seed SIR realisation at β = 0.1. The model achieves an R2 of 0.16, where closeness is the dominant predictor (t = -8.4) and degree follows (t = -4.6). Both values are negative, confirming that the more central the nodes, the earlier they get infected. Betweeness is not significant in this model. Although as we could see from the low R2 value the model explains only a modest fraction, what matters is that it produces a useful ranking of nodes by influence, and that is what we need to select seeds and silencing targets. 
+
+We can take some conclusions from the four-scenario comparison. Model-selected seeds (c) infect almost the same number as people as random seeds, but reach peak infection two time steps earlier. With β = 0.1 the network is above its epidemic threshold, so eventually the infection saturates the giant component regardless of where it starts. On the contrary, model-selected silencing (d) is more effective: it cuts total infections by 32.5% relative to random silencing, and shifts the peak from t= 5 to t = 21. By silencing the right 5% of nodes, it effectively fragments the network's diffusion structure before the outbreak can develop. 
+
+The difference between (c) and (d) shows us that targeted promotion has diminishing returns once transmission probability is high. The spread happens fast whether you start from either the perfect node or a random one. But targeted suppression remains highly effective even at high β, because silencing well-chosen nodes physically disconnects parts of the network and limits the maximum reach of any outbreak.
+
+The linear model is dominated by closeness and in such a hub-centered network closeness alone already identifies most of the structurally critical nodes. But the model adds value mainly by formalising and combining centrality signals rather than uncovering new ones. Because of the structure of our network, closeness is such a strong value that other structural signals are more marginal. 
